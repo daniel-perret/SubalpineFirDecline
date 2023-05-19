@@ -1,0 +1,2178 @@
+---
+title: "Subalpine fir status and trends assessment"
+date: "`r Sys.Date()`"
+author: "D. Perret"
+output: 
+  rmdformats::robobook:
+    code_folding: hide
+    self_contained: true
+editor_options: 
+  chunk_output_type: console
+---
+
+# Introduction
+
+This document contains all the code necessary to replicate analyses from the manuscript titled *Range-wide subalpine fir population assessments indicate widespread disturbance-driven decline*, by DL Perret, DM Bell, AN Gray, JD Shaw, and HSJ Zald.
+
+Some of the estimation code in this document can be quite time-consuming to run. You should expect this document to take 1-2 hours to knit if you choose to run all the code at once.
+
+If you're just interested in FIA estimation code, skip to the `Estimation` section and refer to the supplementary source code file "growMort_rewrite_METRIC.R".
+
+In any section, click the 'Code' button on the right to display the R code used to manipulate data, generate estimates, and/or plot figures.
+
+```{css zoom-lib-src, echo = FALSE, eval=T}
+script src = "https://ajax.googleapis.com/ajax/libs/jquery/3.4.1/jquery.min.js"
+```
+
+```{js zoom-jquery, echo = FALSE, eval=T}
+$(document).ready(function() {
+$('body').prepend('<div class=\"zoomDiv\"><img src=\"\" class=\"zoomImg\"></div>');
+// onClick function for all plots (img's)
+$('img:not(.zoomImg)').click(function() {
+$('.zoomImg').attr('src', $(this).attr('src')).css({width: '100x%'});
+$('.zoomDiv').css({opacity: '1', width: 'auto', border: '1px solid white', borderRadius: '5px', position: 'fixed', top: '50%', left: '50%', marginRight: '-50%', transform: 'translate(-50%, -50%)', boxShadow: '0px 0px 50px #888888', zIndex: '50', overflow: 'auto', maxHeight: '100%'});
+});
+// onClick function for zoomImg
+$('img.zoomImg').click(function() {
+$('.zoomDiv').css({opacity: '0', width: '0%'}); 
+});
+});
+```
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE,
+                      warning = FALSE,
+                      prompt = FALSE,
+                      error = TRUE,
+                      message = FALSE,
+                      cache = FALSE,
+                      cache.lazy = FALSE,
+                      eval = TRUE,
+                      eval.after = "fig.cap")
+
+library(tidyverse)
+library(rFIA)
+library(ggplot2)
+library(ggExtra)
+library(rgdal)
+library(sp)
+library(ggsci)
+library(raster)
+library(splines)
+library(lme4)
+library(patchwork)
+library(quantreg)
+select <- dplyr::select
+
+# setting my preferred ggplot2 theme
+theme_set(theme_bw())
+theme_update(text = element_text(size=16, color = "black"),
+             panel.grid.major = element_blank(),
+             panel.grid.minor = element_blank(),
+             strip.background = element_blank(),
+             panel.border=element_rect(size=1.5))
+
+# colors to be used in all map figures
+mapcolor <- "wheat3"
+linecolor <- "gray40"
+regioncolors <- c("Cascade Mixed Forest" = "#009E73",
+                  "Northern Rocky Mountain Forest-Steppe" = "#56B4E9",
+                  "Middle Rocky Mountain Steppe" = "#E69F00",
+                  "Southern Rocky Mountain Steppe" = "#CC79A7",
+                  "zIntermountain Semi-Desert" = "gray20",
+                  "AZ-NM Mountains" = "#D55E00")
+
+# sourcing estimation base code
+source("/Users/DanielPerret/Box/01. daniel.perret Workspace/PROJECTS/status_trends/growMort_rewrite_METRIC.R")
+
+source("/Users/DanielPerret/Box/01. daniel.perret Workspace/PROJECTS/status_trends/growMort_rewrite.R")
+
+```
+
+# Data preparation {.tabset}
+
+## --
+
+## FIA data
+
+This code uses `rFIA` funtionality to load locally-downloaded FIA data, and performs some basic data manipulation and summaries that come in useful later on.
+
+```{r fia.data, echo=T}
+
+# reading downloaded FIA data from a local directory, using rFIA functionality
+
+all.fia <- readFIA(dir = "/Users/DanielPerret/Box/01. daniel.perret Workspace/fia_data/",
+                   common=T, states=c("WA","OR","ID","MT","WY","UT","CO",
+                                      "CA","NV","NM","AZ"))
+
+#creating some fields in various tables
+
+all.fia$PLOT <- all.fia$PLOT %>% 
+  mutate(pltID = paste(UNITCD,STATECD,COUNTYCD,PLOT,sep="_"),
+         PLT_CN = CN,
+         ECOSUBCD = trimws(ECOSUBCD),
+         state_key = case_when(STATECD == 8 ~ "CO",
+                               STATECD == 30 ~ "MT",
+                               STATECD == 16 ~ "ID",
+                               STATECD == 41 ~ "OR",
+                               STATECD == 53 ~ "WA",
+                               STATECD == 49 ~ "UT",
+                               STATECD == 56 ~ "WY",
+                               STATECD == 6 ~ "CA",
+                               STATECD == 32 ~ "NV",
+                               STATECD == 35 ~ "NM",
+                               STATECD == 4 ~ "AZ")) %>% 
+  group_by(pltID) %>% 
+  mutate(most.recent = ifelse(MEASYEAR==max(MEASYEAR),
+                              "yes","no")) %>% 
+  ungroup()
+
+all.fia$COND <- all.fia$COND %>% 
+  left_join(all.fia$PLOT %>% 
+              select(PLT_CN,most.recent),
+            by="PLT_CN") %>% 
+  mutate(state_key = case_when(STATECD == 8 ~ "CO",
+                               STATECD == 30 ~ "MT",
+                               STATECD == 16 ~ "ID",
+                               STATECD == 41 ~ "OR",
+                               STATECD == 53 ~ "WA",
+                               STATECD == 49 ~ "UT",
+                               STATECD == 56 ~ "WY"))
+
+
+# Because annual inventories began later in Wyoming, we need to link back to earlier period inventories in order to make our eventual change estimates. This code does that by using plot number links and tree azimuth and distance. Note that the files necessary to do this (i.e., "wy_p2alink.csv" and "wy_p2alink_tree.csv") are NOT included in these supplementary materials because they could be used to infer exact plot coordinates, which are protected.
+
+## WY ecoregions for reference
+wy.er <- c("M331Ab","M331Ag","M331Ai","M331Db","M331Dc","M331At","M331Da","M331Ac","M331Aj","M331Ad","M331Jb","M331Ja","M331Df","M331Dm","M331Ba","M331Bb","342Fc","M331Ic","M331Iv","M331Ha")
+
+## plots
+wy.p2a.plotlink <- read.csv("wy_p2alink.csv",header=T,stringsAsFactors=F) %>%
+  select(CN, PREV_PLT_CN.update = PREV_PLT_CN)
+
+### updating plots
+all.fia$PLOT <- all.fia$PLOT %>% 
+  left_join(., wy.p2a.plotlink,
+            by="CN") %>% 
+  mutate(PREV_PLT_CN = ifelse(!is.na(PREV_PLT_CN.update),
+                              PREV_PLT_CN.update,
+                              PREV_PLT_CN)) %>% 
+  select(-PREV_PLT_CN.update) %>% 
+  left_join(all.fia$PLOT %>% 
+              select(PLT_CN,MEASYEAR.prev = MEASYEAR),
+            by = c("PREV_PLT_CN"="PLT_CN")) %>% 
+  mutate(REMPER = ifelse(is.na(REMPER),
+                         MEASYEAR-MEASYEAR.prev,
+                         REMPER))
+## trees
+wy.p2a.treelink <- read.csv("wy_p2alink_tree.csv",header=T,stringsAsFactors=F) %>% 
+  rename(PREV_TRE_CN.update = PREV_TRE_CN)
+
+all.fia$TREE <- all.fia$TREE %>% 
+  left_join(., wy.p2a.treelink,
+            by="CN") %>% 
+  mutate(PREV_TRE_CN = ifelse(!is.na(PREV_TRE_CN.update),
+                              PREV_TRE_CN.update,
+                              PREV_TRE_CN)) %>% 
+  select(-PREV_TRE_CN.update,
+         -PREVDIA,
+         -PREV_STATUS_CD) %>% 
+  left_join(., all.fia$TREE %>% 
+              select(CN, PREVDIA=DIA, PREV_STATUS_CD = STATUSCD),
+            by = c("PREV_TRE_CN" = "CN"))
+
+# Other data curation steps
+
+## creating some fields and updating all SPCDs to most-recently ID'd SPCD -- this is necessary because it's quite common for trees to change species ID, especially in smaller age classes.
+
+all.fia$TREE <- all.fia$TREE %>% 
+  left_join(all.fia$PLOT %>% 
+              select(PLT_CN,most.recent),
+            by="PLT_CN") %>% 
+  mutate(TRE_CN = CN,
+         state_key = case_when(STATECD == 8 ~ "CO",
+                               STATECD == 30 ~ "MT",
+                               STATECD == 16 ~ "ID",
+                               STATECD == 41 ~ "OR",
+                               STATECD == 53 ~ "WA",
+                               STATECD == 49 ~ "UT",
+                               STATECD == 56 ~ "WY"),
+         agent_key = case_when(STATUSCD==2 & AGENTCD %in% c(00,70) ~ "unknown1",
+                               STATUSCD==2 & AGENTCD == 10 ~ "insect",
+                               STATUSCD==2 & AGENTCD == 20 ~ "disease",
+                               STATUSCD==2 & AGENTCD == 30 ~ "fire",
+                               STATUSCD==2 & AGENTCD == 40 ~ "animal",
+                               STATUSCD==2 & AGENTCD == 50 ~ "weather",
+                               STATUSCD==2 & AGENTCD == 60 ~ "competition",
+                               STATUSCD==2 & AGENTCD == 80 ~ "land use",
+                               STATUSCD==2 & is.na(AGENTCD) & 
+                                 (PREV_STATUS_CD==1 | is.na(PREV_STATUS_CD)) ~ "unknown2"),
+         DIA = DIA*2.54,
+         PREVDIA = PREVDIA*2.54) %>% #convert DBH to cm 
+  left_join(.,
+            all.fia$TREE %>% 
+              select(PREV_TRE_CN, SPCD) %>% 
+              rename(LATER_SPCD=SPCD),
+            by=c("TRE_CN"="PREV_TRE_CN")) %>% 
+  mutate(SPCD = case_when(SPCD!=LATER_SPCD & !is.na(LATER_SPCD) ~ LATER_SPCD,
+                          is.na(LATER_SPCD) ~ SPCD,
+                          TRUE ~ SPCD),
+         SPCD = ifelse(SPCD==18, 19, SPCD))
+
+## some summary dataframes and fields for convenience
+abla.trees <- all.fia$TREE %>% 
+  filter(SPCD == 19)
+
+all.fia$PLOT <- all.fia$PLOT %>% 
+  mutate(abla.pres = ifelse(PLT_CN %in% unique(abla.trees$PLT_CN),
+                            1,0))
+
+abla.plots <- all.fia$PLOT %>% 
+  filter(abla.pres==1,
+         most.recent=="yes",
+         MEASYEAR>2009)
+
+abla.cond <- all.fia$COND %>% 
+  filter(PLT_CN %in% abla.plots$PLT_CN)
+
+```
+
+## Climate data
+
+Climate data used in the manuscript were queried from ClimateNA (Wang *et al*., 2012). Given the number of FIA plots involved and the desire to manipulate climate timeseries directly, the climate datafiles themselves are prohibitively large and were not included in this Supplement. The code below is supplied as an illustration of how the data were manipulated, and can be run if the user downloads historic climate timeseries for all FIA sites of interest using freely-available ClimateNA software (see [www.climatena.ca] for complete details).
+
+In the present manuscript, climate data were only used to characterize the conditions occupied by subalpine fir range-wide and within ecological provinces.
+
+```{r climate.data, echo=T}
+# 
+# # reading in 1981 - 2010 climate normals, downloaded from ClimateNA
+# clim.norms <- read.csv("D:/coords_format_Normal_1981_2010Y.csv", header=T) %>% 
+#   select(PLT_CN=ID1,
+#          MAT,
+#          MAP,
+#          DD5,
+#          CMD,
+#          CMI,
+#          FFP) %>% 
+#   mutate(MAT = ifelse(MAT==-9999, NA_real_, MAT))
+# 
+# # reading in 1901-2021 climate timeseries, downloaded from ClimateNA
+# clim.ann <- read.csv("D:/coords_format_1901-2021Y.csv", header=T)
+# 
+# # summarizing climate variables to match the remeasurement period of all FIA plots
+# clim.remper <- clim.ann %>%
+#   select(PLT_CN=ID1,
+#          Year, 7:31) %>% 
+#   mutate(across(where(is.numeric), .fns = ~ifelse(.x==-9999,NA_real_,.x))) %>% 
+#   left_join(all.fia$PLOT %>% 
+#               mutate(REMPER_END = MEASYEAR,
+#                      REMPER_START = MEASYEAR-round(REMPER,digits=0)) %>% 
+#               select(PLT_CN, REMPER_END, REMPER_START)) %>% 
+#   mutate(REMPER_START = ifelse(is.na(REMPER_START), REMPER_END, REMPER_START),
+#          across(3:27, .fns = ~ifelse(Year %in% c(REMPER_START:REMPER_END), .x, NA_real_))) %>%
+#   group_by(PLT_CN) %>% 
+#   summarise(across(MAT:DD1040, ~mean(.x,na.rm=T), .names="{.col}_remper"))
+# 
+# # summarizing climate variables for a "baseline" period 1900-1950
+# clim.base <- clim.ann %>%
+#   select(PLT_CN=ID1,
+#          Year, 7:31) %>% 
+#   filter(Year %in% 1900:1950) %>% 
+#   mutate(across(where(is.numeric), .fns = ~ifelse(.x==-9999,NA_real_,.x))) %>% 
+#   group_by(PLT_CN) %>% 
+#   summarise(across(MAT:DD1040, ~mean(.x,na.rm=T), .names = "{.col}_base"))
+# 
+# # summarizing climate variables for a "recent" period 2010-2021
+# clim.recent <- clim.ann %>%
+#   select(PLT_CN=ID1,
+#          Year, 7:31) %>% 
+#   filter(Year %in% 2010:2021) %>% 
+#   mutate(across(where(is.numeric), .fns = ~ifelse(.x==-9999,NA_real_,.x))) %>% 
+#   group_by(PLT_CN) %>% 
+#   summarise(across(MAT:DD1040, ~mean(.x,na.rm=T), .names = "{.col}_recent"))
+# 
+# 
+# write.csv(clim.norms, file = "clim_norms.csv", row.names = F)
+# write.csv(clim.base, file = "clim_base.csv", row.names = F)
+# write.csv(clim.remper, file = "clim_remper.csv", row.names = F)
+# write.csv(clim.recent, file = "clim_recent.csv", row.names = F)
+
+## Only re-run climate processing code if something needs to be changed! It takes forever to run!
+
+clim.norms <- read.csv("clim_norms.csv",header=T,stringsAsFactors=F)
+clim.base <- read.csv("clim_base.csv", header=T, stringsAsFactors=F)
+clim.remper <- read.csv("clim_remper.csv",header=T,stringsAsFactors=F)
+clim.recent <- read.csv("clim_recent.csv",header=T,stringsAsFactors=F)
+
+# joining climate variables to FIA plots
+all.fia$PLOT <- all.fia$PLOT %>% 
+  left_join(clim.norms,
+            by="PLT_CN") %>%
+  left_join(clim.remper,
+            by="PLT_CN") %>%
+  left_join(clim.base,
+            by="PLT_CN") %>%
+  left_join(clim.recent,
+            by="PLT_CN") %>% 
+  mutate(REMPER_END = MEASYEAR,
+         REMPER_START = MEASYEAR-round(REMPER,digits=0),
+         REMPER_PER = length(REMPER_START:REMPER_END))
+
+
+```
+
+## Spatial data
+
+This code loads and curates spatial data necessary for reproducing manuscript analyses and figures.
+
+```{r}
+
+# WGS84
+old.proj <- "+proj=longlat +ellps=WGS84 +datum=WGS84 +no_defs"
+
+# Albers Equal Area; centered in western US
+base.proj <- "+proj=aea +lat_0=23 +lon_0=-96 +lat_1=29.5 +lat_2=45.5 +x_0=0 +y_0=0 +datum=NAD83 +units=m +no_defs"
+
+# US state boundaries
+states <- readOGR(dsn="/Users/DanielPerret/Box/01. daniel.perret Workspace/base_spatialdata/state_boundaries",
+                  layer = "state_boundaries", verbose=F) %>% 
+  spTransform(.,
+              CRSobj = CRS(base.proj))
+
+# North American continent
+cont <- readOGR(dsn="/Users/DanielPerret/Box/01. daniel.perret Workspace/base_spatialdata/continents",
+                layer = "na",
+                verbose=F,
+                p4s = old.proj) %>% 
+  spTransform(.,
+              CRSobj = CRS(base.proj))
+
+# Subalpine fir range
+range <- readOGR(dsn="/Users/DanielPerret/Box/01. daniel.perret Workspace/base_spatialdata/named_ranges",
+                 layer = "abielasi",
+                 verbose = F,
+                 p4s = old.proj) %>% 
+  spTransform(.,
+              CRSobj = CRS(base.proj))
+
+# making a SpatialPointsDataFrame for subalpine fir plot locations (fuzzed)
+abla.sp <- abla.plots %>% 
+  SpatialPointsDataFrame(coords = .[,c("LON","LAT")],
+                         data = .,
+                         proj4string = CRS(old.proj)) %>% 
+  spTransform(.,
+              CRSobj = CRS(base.proj))
+
+# Level 4 ecoregions (i.e., ecoregion subsections)
+er4 <- readOGR(dsn="/Users/DanielPerret/Box/01. daniel.perret Workspace/base_spatialdata/cleland_usfs_ecoregions",
+               layer = "S_USA.EcomapSubsections",
+               verbose=F) %>% 
+  spTransform(.,
+              CRSobj = CRS(base.proj))
+
+# Level 3 ecoregions (i.e., ecoregion sections)
+er3 <- readOGR(dsn="/Users/DanielPerret/Box/01. daniel.perret Workspace/base_spatialdata/cleland_usfs_ecoregions",
+               layer = "S_USA.EcomapSections",
+               verbose=F) %>% 
+  spTransform(.,
+              CRSobj = CRS(base.proj))
+
+# Level 2 ecoregions (i.e., ecological provinces)
+er2 <- readOGR(dsn="/Users/DanielPerret/Box/01. daniel.perret Workspace/base_spatialdata/cleland_usfs_ecoregions",
+               layer = "S_USA.EcoMapProvinces",
+               verbose=F) %>% 
+  spTransform(.,
+              CRSobj = CRS(base.proj))
+
+# extracting ecoregions that contain subalpine fir
+
+er4.abla <- er4[abla.sp,]
+er3.abla <- er3[abla.sp,]
+er2.abla <- er2[abla.sp,]
+
+```
+
+# Population summaries {.tabset}
+
+## --
+
+## Ecological provinces {.tabset .tabset-pills}
+
+Here we form the six approximate ecological provinces occupied by subalpine fir, and plot their distribution in geographic and climate space.
+
+### code
+
+```{r}
+
+# Joining plot locations with ecological province designations, then lumping similar designations to form broader groups. See Cleland et al. 2006 for more information about designations.
+
+PLOT.sp <- all.fia$PLOT %>% 
+  filter(!is.na(LON)) %>% 
+  SpatialPointsDataFrame(coords= .[,c("LON","LAT")],
+                         data = .,
+                         proj4string = CRS(old.proj)) %>% 
+  spTransform(.,CRSobj=CRS(base.proj)) %>% 
+  as(.,"sf") %>% 
+  sf::st_join(., er2 %>% 
+                as(.,"sf") %>% 
+                select(ECOPROVCD=MAP_UNIT_S,
+                       ECOPROVNAM=MAP_UNIT_N),
+              left=T) %>% 
+  mutate(ECO_GRP_NEW = case_when(ECOPROVCD %in% c("242","M242") ~ "M242",
+                                 ECOPROVCD %in% c("341", "M341","342") ~ "M341",
+                                 ECOPROVCD %in% c("331", "M331") ~ "M331",
+                                 ECOPROVCD %in% c("313", "M313", "321") ~ "M313",
+                                 is.na(ECOPROVCD) ~ "M333",
+                                 TRUE~ECOPROVCD),
+         ECO_GRP_NEW_NAM = case_when(ECO_GRP_NEW == "M242" ~ "Cascade Mixed Forest",
+                                     ECO_GRP_NEW == "M313" ~ "AZ-NM Mountains",
+                                     ECO_GRP_NEW == "M331" ~ "Southern Rocky Mountain Steppe",
+                                     ECO_GRP_NEW == "M332" ~ "Middle Rocky Mountain Steppe",
+                                     ECO_GRP_NEW == "M333" ~ "Northern Rocky Mountain Forest-Steppe",
+                                     ECO_GRP_NEW == "M341" ~ "zIntermountain Semi-Desert",
+                                     TRUE ~ "Cascade Mixed Forest"))
+
+# joining designations back to FIA plot tables
+
+all.fia$PLOT <- all.fia$PLOT %>% 
+  left_join(., PLOT.sp %>% 
+              sf::st_drop_geometry() %>% 
+              select(PLT_CN, ECOPROVCD,ECOPROVNAM, ECO_GRP_NEW, ECO_GRP_NEW_NAM),
+            by="PLT_CN")
+```
+
+### map (Fig. 1A)
+
+```{r, fig.cap=caption}
+
+caption <- "Reproduction of main text Figure 1A"
+
+ggplot() +
+  geom_sf(data = cont %>% 
+            as(.,"sf"),
+          col=linecolor,
+          fill = mapcolor) + 
+  geom_sf(data = states %>% 
+            as(.,"sf"),
+          fill=NA,
+          col=linecolor) +
+  geom_sf(data = PLOT.sp %>% 
+            filter(abla.pres==1),
+          #!ECOPROVCD%in%c("M331")),
+          aes(bg = ECO_GRP_NEW_NAM),
+          pch=21,
+          col="black",
+          alpha=0.6, size = 3.5)+
+  geom_sf(data = states %>% 
+            as(.,"sf"),
+          fill=NA,
+          col=linecolor,
+          lty=2) +
+  theme(panel.background = element_rect(fill="skyblue1")) +
+  lims(x = c(-2.5e6, -0.5e6),
+       y = c(1.00e6,3.25e6)) +
+  scale_color_manual(name = "Ecological Province",aesthetics = c("bg"),
+                     values = regioncolors)
+
+```
+
+### climate space (Fig. 1B)
+
+```{r, fig.cap=caption}
+caption <- "Reproduction of main text Figure 1B"
+
+all.fia$PLOT %>%
+  #as(.,"Spatial") %>% 
+  filter(abla.pres==1,
+         !is.na(MAT_remper),
+         !is.na(ECO_GRP_NEW_NAM)) %>% 
+  group_by(ECO_GRP_NEW_NAM) %>% 
+  slice(chull(x = MAT_remper,
+              y = MAP_remper)) %>% 
+  ggplot(aes(x = MAT_remper,
+             y = MAP_remper)) +
+  geom_polygon(aes(group = ECO_GRP_NEW_NAM,
+                   fill = ECO_GRP_NEW_NAM,
+                   col = ECO_GRP_NEW_NAM),
+               alpha=0.4,
+               lwd=1.3) +
+  scale_color_manual(name = "Ecological Province",aesthetics = c("fill","col"),
+                     values = regioncolors) +
+  labs(x = "Mean annual temperature",
+       y = "Mean annual precipitation") +
+  theme(legend.position = "none")
+```
+
+## Size distribution (Fig. 1C)
+
+Here we use basic `rFIA` functionality to estimate the size distributions of live and dead subalpine fir in each ecological province. Figure code contains the estimation as well.
+
+```{r, fig.cap=caption}
+
+caption <- "Reproduction of main text Figure 1C"
+
+# make size classes
+all.fia$TREE$newSize <- makeClasses(all.fia$TREE$DIA, interval = 10, numLabs=FALSE, lower = 12.7, upper = 100)
+
+# rFIA estimates
+tpasize.all <-  all.fia %>% 
+  clipFIA(.,
+          mostRecent=T) %>% 
+  tpa(.,
+      grpBy = c(ECO_GRP_NEW_NAM,
+                STATUSCD,newSize),
+      treeDomain = SPCD==19,
+      #bySizeClass=TRUE,
+      totals = TRUE,
+      treeType = "all",
+      variance = T) %>% 
+  mutate(TREE_TOTAL_SD = sqrt(TREE_TOTAL_VAR),
+         status = ifelse(STATUSCD==1,"alive","dead"))
+
+# plot
+tpasize.all %>%
+  mutate(ECO_GRP_NEW_NAM = factor(ECO_GRP_NEW_NAM, 
+                                  levels = c("Cascade Mixed Forest",
+                                             "Northern Rocky Mountain Forest-Steppe",
+                                             "Middle Rocky Mountain Steppe",
+                                             "Southern Rocky Mountain Steppe",
+                                             "zIntermountain Semi-Desert",
+                                             "AZ-NM Mountains"))) %>% 
+  ggplot(.,
+         aes(x = newSize,
+             y = TREE_TOTAL/1000000,
+             group = status,
+             fill = ECO_GRP_NEW_NAM)) +
+  geom_col(position=position_dodge(0.9),
+           col="black",
+           aes(alpha=status)) +
+  geom_errorbar(aes(ymin = (TREE_TOTAL - (TREE_TOTAL_SD*1.96))/1000000, # approximate 95CIs
+                    ymax = (TREE_TOTAL + (TREE_TOTAL_SD*1.96))/1000000),
+                position=position_dodge(0.9),
+                width=0.3,
+                lwd=0.9)+
+  labs(x = "Size class (cm)",
+       y = "Number of trees") +
+  theme(axis.text.x = element_text(angle=45,hjust=1,size=15),
+        legend.key.size = unit(1,"cm"),
+        strip.text.x=element_blank()) +
+  scale_y_continuous(labels = scales::comma,
+                     name = "Number of trees (millions)") +
+  scale_alpha_manual(values = c("alive" = 1,
+                                "dead" = 0.3)) +
+  scale_fill_manual(name = "Ecological Province",aesthetics = "bg",
+                    values = regioncolors) +
+  facet_wrap(facets=~ECO_GRP_NEW_NAM, scales="free_y",nrow = 3) +
+  theme(legend.position="none")
+
+
+
+
+
+```
+
+## Community composition {.tabset .tabset-pills}
+
+### Forest type (Fig. S1)
+
+```{r fig.cap=caption}
+
+caption <- "Figure S1. The frequency of forest types assigned to primary condition classes of FIA plots containing subalpine fir during the 2010-2019 inventory period."
+
+# abla.plots <- all.fia$TREE %>% 
+#   filter(SPCD==19, most.recent=="yes") %>% 
+#   pull(PLT_CN) %>% 
+#   unique()
+
+abla.cond <- all.fia %>% 
+  .$COND %>% 
+  filter(PLT_CN %in% abla.plots$PLT_CN,
+         CONDID == 1) %>% 
+  mutate(
+    FORTYPGRP_key = case_when(
+      substr(FORTYPCD,1,2) == 20 ~ "Douglas fir",
+      substr(FORTYPCD,1,2) == 22 ~ "Ponderosa pine",
+      substr(FORTYPCD,1,2) == 24 ~ "Western white pine",
+      substr(FORTYPCD,1,2) == 26 ~ "Fir/spruce/hemlock",
+      substr(FORTYPCD,1,2) == 27 ~ "Fir/spruce/hemlock", # check this one!
+      substr(FORTYPCD,1,2) == 28 ~ "Lodgepole pine",
+      substr(FORTYPCD,1,2) == 30 ~ "Hemlock/Sitka spruce",
+      substr(FORTYPCD,1,2) == 32 ~ "Western larch",
+      substr(FORTYPCD,1,2) == 36 ~ "Other western softwoods",
+      substr(FORTYPCD,1,2) == 70 ~ "Elm/ash/cottonwood",
+      substr(FORTYPCD,1,2) == 90 ~ "Aspen/birch",
+      substr(FORTYPCD,1,2) == 91 ~ "Alder/maple",
+      substr(FORTYPCD,1,2) == 97 ~ "Woodland hardwoods",
+      substr(FORTYPCD,1,2) == 99 ~ "Nonstocked",
+      is.na(FORTYPCD) ~ "Unknown"),
+    FORTYPCD_key = case_when(
+      FORTYPCD==201 ~ "Douglas fir",
+      FORTYPCD==221 ~ "Ponderosa pine",
+      FORTYPCD==241 ~ "Western white pine",
+      FORTYPCD==261 ~ "White fir",
+      FORTYPCD==262 ~ "Red fir",
+      FORTYPCD==263 ~ "Noble fir",
+      FORTYPCD==264 ~ "Pacific silver fir",
+      FORTYPCD==265 ~ "Engelmann spruce",
+      FORTYPCD==266 ~ "Engelmann spruce/subalpine fir",
+      FORTYPCD==267 ~ "Grand fir",
+      FORTYPCD==268 ~ "Subalpine fir",
+      FORTYPCD==269 ~ "Blue spruce",
+      FORTYPCD==270 ~ "Mountain hemlock",
+      FORTYPCD==271 ~ "Alaska-yellow-cedar",
+      FORTYPCD==281 ~ "Lodgepole pine",
+      FORTYPCD==301 ~ "Western hemlock",
+      FORTYPCD==304 ~ "Western redcedar",
+      FORTYPCD==321 ~ "Western larch",
+      FORTYPCD==366 ~ "Limber pine",
+      FORTYPCD==367 ~ "Whitebark pine",
+      FORTYPCD==368 ~ "Misc. softwoods",
+      FORTYPCD==703 ~ "Cottonwood",
+      FORTYPCD==709 ~ "Cottonwood/willow",
+      FORTYPCD==901 ~ "Aspen",
+      FORTYPCD==911 ~ "Red alder",
+      FORTYPCD==971 ~ "Deciduous oak woodland",
+      FORTYPCD==974 ~ "Cercocarpus woodland",
+      FORTYPCD==975 ~ "Intermountain maple woodland",
+      FORTYPCD==999 ~ "Nonstocked",
+      is.na(FORTYPCD) ~ "Unknown",
+      TRUE ~ "Unknown"
+    ))
+
+abla.cond %>% 
+  ggplot(.,
+         aes(y = reorder(FORTYPCD_key,
+                         FORTYPCD_key,
+                         length))) +
+  geom_bar(orientation = "y") +
+  labs(x = "Number of plots",
+       y = "")
+
+```
+
+### Co-occurring species (Fig. S2)
+
+```{r fig.cap = caption}
+
+caption <- "Figure S2. Frequency of the top 10 species that co-occurred with subalpine fir on FIA plots during the 2010-2019 inventory period."
+
+# abla.plots <- all.fia$TREE %>% 
+#   filter(SPCD==19, most.recent=="yes") %>% 
+#   pull(PLT_CN) %>% 
+#   unique()
+
+counts <- all.fia$TREE %>% 
+  filter(PLT_CN %in% abla.plots$PLT_CN,
+         SPCD!=19,
+         INVYR>2009) %>% 
+  select(PLT_CN,SPCD) %>% 
+  distinct() %>% 
+  count(SPCD) %>% 
+  as.data.frame() %>% 
+  mutate(species = case_when(SPCD==93 ~ "Engelmann spruce",
+                             SPCD==108 ~ "Lodgepole pine",
+                             SPCD==202 ~ "Douglas fir",
+                             SPCD==101 ~ "Whitebark pine",
+                             SPCD==746 ~ "Aspen",
+                             SPCD==73 ~ "Western larch",
+                             SPCD==17 ~ "Grand fir",
+                             SPCD==264 ~ "Mountain hemlock",
+                             SPCD==113 ~ "Limber pine",
+                             SPCD==119 ~ "Western white pine",
+                             SPCD==11 ~ "Pacific silver fir")) %>% 
+  arrange(n)
+
+counts %>% 
+  .[nrow(.):(nrow(.)-9),] %>% 
+  ggplot(., aes(y = factor(species, levels=counts$species),
+                x = n)) +
+  geom_col() +
+  labs(x = "Number of plots",
+       y = "")+
+  theme(axis.text = element_text(size=20),
+        axis.title = element_text(size=25))
+```
+
+## Tree damages {.tabset .tabset-pills}
+### Living (Table S1)
+
+```{r}
+
+all.fia$TREE %>% 
+  filter(SPCD == 19,
+         STATUSCD == 1,
+         INVYR > 2009) %>% 
+  pull(DAMAGE_AGENT_CD1) -> d1
+all.fia$TREE %>% 
+  filter(SPCD == 19,
+         STATUSCD == 1,
+         INVYR > 2009) %>% 
+  pull(DAMAGE_AGENT_CD2) -> d2
+all.fia$TREE %>% 
+  filter(SPCD == 19,
+         STATUSCD == 1,
+         INVYR > 2009) %>% 
+  pull(DAMAGE_AGENT_CD3) -> d3
+
+d <- data.frame(DAM = c(d1,d2,d3)) %>% 
+  na.omit()
+
+count(d, DAM) %>% 
+  arrange(-n) %>% 
+  slice(1:25)
+
+```
+
+
+### Dead (Table S2)
+
+```{r}
+
+mort.trees <- all.fia$TREE %>% 
+  filter(SPCD == 19,
+         STATUSCD == 2,
+         PREV_STATUS_CD == 1,
+         INVYR > 2009) %>% 
+  pull(PREV_TRE_CN)
+
+all.fia$TREE %>% 
+  filter(CN %in% mort.trees) %>% 
+  pull(DAMAGE_AGENT_CD2) -> m1
+all.fia$TREE %>% 
+  filter(CN %in% mort.trees) %>% 
+  pull(DAMAGE_AGENT_CD2) -> m2
+all.fia$TREE %>% 
+  filter(CN %in% mort.trees) %>% 
+  pull(DAMAGE_AGENT_CD3) -> m3
+
+m <- data.frame(DAM = c(m1,m2,m3)) %>% 
+  na.omit()
+
+count(m, DAM) %>% 
+  arrange(-n) %>% 
+  slice(1:26)
+
+```
+
+
+# Estimation
+
+**See main manuscript text for methods descriptions.** In general, we followed estimation procedures from Bechtold & Patterson 2005, as implemented in `rFIA` (Stanke et al. 2020). However, `rFIA` is unable to estimate population change across all western states because growth, recruitment, and mortality (GRM) components are not consistently implemented in the FIA database. We therefore re-worked `rFIA` functions (specifically, `rFIA::growMort()`, `rFIA:::growMortStarter()`, and `rFIA:::typeDomain_grow()`) to re-assign GRM components consistently across all states and regions. We further modified these functions to supply decadal rates of change rather than annualized rates and to supply metric units, among other changes. Annotated code for the modified functions is contained in the "growMort_rewrite_METRIC.R" file (also sourced in this document). We validated our modified estimation functions against Bechtold & Patterson (2005) estimation procedures as implemented in SAS by A.N. Gray (USDA Forest Service, PNWRS-FIA).
+
+
+
+## 1) Change estimates
+
+```{r}
+
+# rewritten estimation code needs us to specify the FIA EvalIDs that we're interested in
+evals <- c(21903,41903,61903,81903,161903,301903,321903,351903,411903,491903,531903,561903)
+
+# minimum size threshold for estimate
+# thresh <- 5 # 5 if DBH is in inches
+thresh <- 12.7 # 12.7 if DBH is in cm
+
+## Density change estimate for just subalpine fir
+dtpa.er.abla <- growMort_dlp.metric(db = all.fia,
+                                    stateVar = "TPA",
+                                    treeDomain=SPCD==19,
+                                    polys = er4.abla %>% 
+                                      sf::st_as_sf() %>% 
+                                      select(MAP_UNIT_S),
+                                    totals=T,
+                                    returnSpatial=F,
+                                    sizeThresh=thresh,
+                                    evals=evals) %>% 
+  group_by(MAP_UNIT_S) %>% 
+  filter(YEAR==max(YEAR))
+
+## Density change estimates for all species
+dtpa.er.sp <- growMort_dlp.metric(db = all.fia,
+                                  stateVar = "TPA",
+                                  polys = er4.abla %>%
+                                    sf::st_as_sf() %>%
+                                    select(MAP_UNIT_S),
+                                  #areaDomain = abla.pres==1,
+                                  grpBy = SPCD,
+                                  totals = TRUE,
+                                  returnSpatial = T, 
+                                  nCores = 4,
+                                  sizeThresh=thresh,
+                                  evals = evals,
+                                  method="TI") %>% 
+  group_by(MAP_UNIT_S) %>% 
+  filter(YEAR==max(YEAR)) # 2019 inventory for all states but WY
+
+## Basal area change estimates for all species
+dbaa.er.sp <- all.fia %>% 
+  growMort_dlp.metric(db = .,
+                      stateVar = "BAA",
+                      polys = er4.abla %>%
+                        sf::st_as_sf() %>% 
+                        select(MAP_UNIT_S),
+                      #areaDomain = abla.pres==1,
+                      grpBy = SPCD,
+                      totals = TRUE,
+                      returnSpatial = F, 
+                      nCores = 4,
+                      sizeThresh=thresh,
+                      evals = evals,
+                      method="TI") %>% 
+  group_by(MAP_UNIT_S) %>% 
+  filter(YEAR==max(YEAR))
+
+#combining TPA and BAA change estimates
+dall.er.sp <- left_join(dtpa.er.sp, dbaa.er.sp,
+                        suffix = c(".tph",".bah"),
+                        by=c("MAP_UNIT_S","polyID","SPCD","YEAR",
+                             "N","nPlots_TREE","nPlots_AREA",
+                             "AREA_TOTAL_ac","AREA_TOTAL_ha",
+                             "AREA_TOTAL_SE","AREA_TOTAL_ha_SE",
+                             "AREA_TOTAL_CV","AREA_TOTAL_ha_CV",
+                             "AREA_TOTAL_VAR","AREA_TOTAL_ha_VAR"))
+
+```
+
+## 2) Agent-specific mortality
+
+```{r}
+
+# range-wide agent mortality estimates
+range.agent <- all.fia %>% 
+  growMort_dlp.metric(db = .,
+                      stateVar = "TPA",
+                      totals=T,
+                      treeDomain = SPCD == 19,
+                      grpBy = agent_key,
+                      sizeThresh = thresh,
+                      evals = evals) %>% 
+  filter(YEAR == 2019)
+
+
+# ecoregional estimates, all species
+dtpa.er.sp.agent <- all.fia %>% 
+  growMort_dlp.metric(db = .,
+                      stateVar = "TPA",
+                      polys = er4.abla %>%
+                        sf::st_as_sf() %>% 
+                        select(MAP_UNIT_S),
+                      totals = TRUE,
+                      grpBy = c(SPCD, agent_key),
+                      returnSpatial = F, 
+                      nCores = 4,
+                      sizeThresh = thresh,
+                      evals = evals,
+                      method="TI") %>% 
+  group_by(MAP_UNIT_S) %>% 
+  filter(YEAR==max(YEAR))
+
+# summarising mortality and estimating recruitment
+mort.decomp.sp <- dtpa.er.sp.agent %>%
+  sf::st_drop_geometry() %>% 
+  group_by(MAP_UNIT_S,SPCD) %>% 
+  summarise(FIRE_MORT = 
+              sum((CHNG_TOTAL)*ifelse(agent_key=="fire",1,0),na.rm=T)*-1,
+            DISEASE_MORT = 
+              sum((CHNG_TOTAL)*ifelse(agent_key=="disease",1,0),na.rm=T)*-1,
+            INSECT_MORT = 
+              sum((CHNG_TOTAL)*ifelse(agent_key=="insect",1,0),na.rm=T)*-1,
+            ID_MORT = 
+              sum((CHNG_TOTAL)*ifelse(agent_key%in%c("insect","disease"),1,0),na.rm=T)*-1) %>%
+  mutate(FIRE_MORT = ifelse(is.na(FIRE_MORT),0,FIRE_MORT),
+         INSECT_MORT = ifelse(is.na(INSECT_MORT),0,INSECT_MORT),
+         DISEASE_MORT = ifelse(is.na(DISEASE_MORT),0,DISEASE_MORT),
+         ID_MORT = ifelse(is.na(ID_MORT),0,ID_MORT)) %>% 
+  left_join(all.fia$PLOT %>% 
+              filter(most.recent=="yes",
+                     !is.na(REMPER)) %>% 
+              select(PLT_CN,ECOSUBCD,MEASYEAR,REMPER) %>% 
+              mutate(REMPER=round(REMPER,0)) %>% 
+              group_by(ECOSUBCD) %>% 
+              summarise(minT1yr = min(MEASYEAR-REMPER),
+                        maxT1yr = max(MEASYEAR-REMPER),
+                        minT2yr = min(MEASYEAR),
+                        maxT2yr = max(MEASYEAR)),
+            by=c("MAP_UNIT_S"="ECOSUBCD")) %>% 
+  ungroup()
+
+# filtering for abla
+mort.decomp.abla <- mort.decomp.sp %>% 
+  filter(SPCD==19)
+
+```
+
+## 3) Summarizing for subalpine fir
+
+```{r}
+# summarising for abla-specific rates
+
+# binning estimates by subalpine fir and non-subalpine fir
+dall.er.abla <- dall.er.sp %>% 
+  filter(SPCD==19) %>% 
+  left_join(dall.er.sp %>% 
+              sf::st_drop_geometry() %>% 
+              filter(SPCD!=19) %>% 
+              group_by(MAP_UNIT_S) %>% 
+              summarise(across(where(is.numeric),sum)) %>% 
+              select(-contains("AREA")) %>% 
+              ungroup(),
+            suffix = c("",".all"),
+            by = c("MAP_UNIT_S")) %>% 
+  mutate(CURR_BAH.prop = CURR_TOTAL.bah/CURR_TOTAL.bah.all,
+         CURR_TPH.prop = CURR_TOTAL.tph/CURR_TOTAL.tph.all,
+         PREV_BAH.prop = PREV_TOTAL.bah/PREV_TOTAL.bah.all,
+         PREV_TPH.prop = PREV_TOTAL.tph/PREV_TOTAL.tph.all,
+         
+         CHNG_TOTAL.tph.nonabla = (CURR_TOTAL.tph.all-CURR_TOTAL.tph)-(PREV_TOTAL.tph.all-PREV_TOTAL.tph),
+         CHNG_TOTAL.bah.nonabla = (CURR_TOTAL.bah.all-CURR_TOTAL.bah)-(PREV_TOTAL.bah.all-PREV_TOTAL.bah),
+         
+         quadrant.baa = case_when(CHNG_TOTAL.bah < 0 &  CHNG_TOTAL.bah.nonabla < 0 ~ 1,
+                                  CHNG_TOTAL.bah < 0 &  CHNG_TOTAL.bah.nonabla >= 0 ~ 2,
+                                  CHNG_TOTAL.bah >= 0 & CHNG_TOTAL.bah.nonabla >= 0 ~ 3,
+                                  CHNG_TOTAL.bah >= 0 & CHNG_TOTAL.bah.nonabla < 0 ~ 4),
+         
+         quadrant.tpa = case_when(CHNG_TOTAL.tph < 0 &  CHNG_TOTAL.tph.nonabla < 0 ~ 1,
+                                  CHNG_TOTAL.tph < 0 &  CHNG_TOTAL.tph.nonabla >= 0 ~ 2,
+                                  CHNG_TOTAL.tph >= 0 & CHNG_TOTAL.tph.nonabla >= 0 ~ 3,
+                                  CHNG_TOTAL.tph >= 0 & CHNG_TOTAL.tph.nonabla < 0 ~ 4),
+         
+         change.cat = case_when(CHNG_PERC.tph <= 0 & CHNG_PERC.bah <= 0 ~ 1,
+                                CHNG_PERC.tph <= 0 & CHNG_PERC.bah > 0 ~ 2,
+                                CHNG_PERC.tph > 0 & CHNG_PERC.bah > 0 ~ 3,
+                                CHNG_PERC.tph > 0 & CHNG_PERC.bah <= 0 ~ 4)) %>% 
+  filter(CURR_TOTAL.tph > 0 | PREV_TOTAL.tph > 0) %>% 
+  left_join(mort.decomp.abla)
+
+## joining province groupings
+dall.er.abla <- dall.er.abla %>% 
+  sf::st_join(., er2 %>% 
+                as(.,"sf") %>% 
+                select(ECOPROVCD=MAP_UNIT_S,
+                       ECOPROVNAM=MAP_UNIT_N),
+              left=T,
+              join = sf::st_covered_by) %>% 
+  mutate(ECO_GRP_NEW = case_when(ECOPROVCD %in% c("242","M242","M261","M342") ~ "M242",
+                                 ECOPROVCD %in% c("341", "M341","342") ~ "M341",
+                                 ECOPROVCD %in% c("M331") ~ "M331",
+                                 ECOPROVCD %in% c("313", "M313", "321") ~ "M313",
+                                 is.na(ECOPROVCD) ~ "M333",
+                                 TRUE~ECOPROVCD),
+         ECO_GRP_NEW_NAM = case_when(ECO_GRP_NEW == "M242" ~ "Cascade Mixed Forest",
+                                     ECO_GRP_NEW == "M313" ~ "AZ-NM Mountains",
+                                     ECO_GRP_NEW == "M331" ~ "Southern Rocky Mountain Steppe",
+                                     ECO_GRP_NEW == "M332" ~ "Middle Rocky Mountain Steppe",
+                                     ECO_GRP_NEW == "M333" ~ "Northern Rocky Mountain Forest-Steppe",
+                                     ECO_GRP_NEW == "M341" ~ "zIntermountain Semi-Desert"))
+```
+
+## 4) Regeneration estimates
+
+```{r}
+
+seed <- all.fia %>% 
+  seedling(.,
+           polys = er4.abla %>% 
+             sf::st_as_sf() %>% 
+             select(MAP_UNIT_S),
+           treeDomain = SPCD%in%c(19,18),
+           bySpecies = F,
+           totals = T,
+           returnSpatial = F) %>% 
+  filter(YEAR%in%c(2009,2010,2019))
+
+sapling <- all.fia %>% 
+  growMort_dlp.metric(db = .,
+                      stateVar = "TPA",
+                      polys = er4.abla %>%
+                        sf::st_as_sf() %>%
+                        select(MAP_UNIT_S),
+                      treeDomain = DIA<12.7, # DBH in cm
+                      grpBy=SPCD,
+                      totals = TRUE,
+                      nCores = 4,
+                      sizeThresh=1,
+                      evals = evals,
+                      method="TI") %>%
+  filter(SPCD==19) %>% 
+  group_by(MAP_UNIT_S) %>% 
+  filter(YEAR==max(YEAR))  
+
+#join with summary dataframe
+dall.er.abla <- dall.er.abla %>% 
+  left_join(., seed %>% 
+              sf::st_drop_geometry() %>%
+              mutate(SEED_AREA_ha=AREA_TOTAL*0.4047) %>% 
+              select(YEAR, MAP_UNIT_S,
+                     SEED_TPA = TPA,
+                     SEED_TOTAL = TREE_TOTAL,
+                     SEED_SE = TREE_TOTAL_SE) %>% 
+              pivot_wider(.,
+                          names_from=YEAR,
+                          values_from=c(SEED_TPA,SEED_TOTAL,SEED_SE)) %>% 
+              mutate(SEED_TPA_2009 = ifelse(is.na(SEED_TPA_2009),
+                                            SEED_TPA_2010,
+                                            SEED_TPA_2009)),
+            by="MAP_UNIT_S") %>% 
+  left_join(., sapling %>% 
+              select(MAP_UNIT_S,
+                     SAP_TPH = CURR_TPH,
+                     SAP_TOTAL = CURR_TOTAL,
+                     SAP_SE = CURR_TOTAL_SE,
+                     SAP_AREA_ha = AREA_TOTAL_ha,
+                     SAP_PREV = PREV_TOTAL,
+                     SAP_RECR = RECR_TOTAL,
+                     SAP_RECR_SE = RECR_TOTAL_SE))
+
+```
+
+## 5) Disturbed area
+
+```{r}
+
+# getting plot-level expansion factors by PLT_CN
+popinfo <- rFIA::getDesignInfo(all.fia,type="ALL") %>% 
+  left_join(all.fia$POP_STRATUM %>% 
+              select(STRATUM_CN=CN,
+                     EXPNS),
+            by="STRATUM_CN")
+
+# plots with fire mortality
+fire.plots <- all.fia$TREE %>% 
+  filter(most.recent=="yes",
+         SPCD==19,
+         agent_key=="fire") %>% 
+  pull(PLT_CN) %>% 
+  unique()
+
+# plots with insect mortality
+insect.plots <- all.fia$TREE %>% 
+  filter(most.recent=="yes",
+         SPCD==19,
+         agent_key=="insect") %>% 
+  pull(PLT_CN) %>% 
+  unique()
+
+# plots with disease mortality
+disease.plots <- all.fia$TREE %>% 
+  filter(most.recent=="yes",
+         SPCD==19,
+         agent_key=="disease") %>% 
+  pull(PLT_CN) %>% 
+  unique()
+
+# animal
+animal.plots <- all.fia$TREE %>% 
+  filter(most.recent=="yes",
+         SPCD==19,
+         agent_key=="animal") %>% 
+  pull(PLT_CN) %>% 
+  unique()
+
+# competition
+competition.plots <- all.fia$TREE %>% 
+  filter(most.recent=="yes",
+         SPCD==19,
+         agent_key=="competition") %>% 
+  pull(PLT_CN) %>% 
+  unique()
+
+# weather
+weather.plots <- all.fia$TREE %>% 
+  filter(most.recent=="yes",
+         SPCD==19,
+         agent_key=="weather") %>% 
+  pull(PLT_CN) %>% 
+  unique()
+
+# land use
+land.plots <- all.fia$TREE %>% 
+  filter(most.recent=="yes",
+         SPCD==19,
+         agent_key=="land_use") %>% 
+  pull(PLT_CN) %>% 
+  unique()
+
+# unknown mortality
+unknown.plots <- all.fia$TREE %>% 
+  filter(most.recent=="yes",
+         SPCD==19,
+         agent_key=="unknown") %>% 
+  pull(PLT_CN) %>% 
+  unique()
+
+# total
+all.plots <- all.fia$TREE %>% 
+  filter(most.recent=="yes",
+         SPCD==19) %>% 
+  pull(PLT_CN) %>% 
+  unique()
+
+# summing up plot expansion factors for mortality types across all plots
+mort.area.all <- all.fia$PLOT %>% 
+  left_join(popinfo %>% 
+              select(PLT_CN,EXPNS)) %>%
+  summarise(fire.area = sum(EXPNS*ifelse(PLT_CN %in% fire.plots, 1, 0), na.rm=T),
+            insect.area = sum(EXPNS*ifelse(PLT_CN %in% insect.plots, 1, 0), na.rm=T),
+            disease.area = sum(EXPNS*ifelse(PLT_CN %in% disease.plots, 1, 0), na.rm=T),
+            id.area = sum(EXPNS*ifelse(PLT_CN %in% c(disease.plots,insect.plots), 1, 0), na.rm=T),
+            fid.area = sum(EXPNS*ifelse(PLT_CN %in% c(fire.plots,disease.plots,insect.plots), 1, 0), na.rm=T),
+            animal.area = sum(EXPNS*ifelse(PLT_CN %in% animal.plots, 1, 0), na.rm=T),
+            competition.area = sum(EXPNS*ifelse(PLT_CN %in% competition.plots, 1, 0), na.rm=T),
+            weather.area = sum(EXPNS*ifelse(PLT_CN %in% weather.plots, 1, 0), na.rm=T),
+            land.area = sum(EXPNS*ifelse(PLT_CN %in% land.plots, 1, 0), na.rm=T),
+            unknown.area = sum(EXPNS*ifelse(PLT_CN %in% unknown.plots, 1, 0), na.rm=T),
+            total.area = sum(EXPNS*ifelse(PLT_CN %in% all.plots, 1, 0), na.rm=T))
+
+# summing plot expansion factors for mortality types within ecoregion subsections
+mort.area.er <- all.fia$PLOT %>% 
+  left_join(popinfo %>% 
+              select(PLT_CN,EXPNS)) %>%
+  group_by(ECOSUBCD) %>%
+  filter(ECOSUBCD %in% er4.abla$MAP_UNIT_S) %>% 
+  summarise(area.fire = sum(EXPNS*ifelse(PLT_CN %in% fire.plots, 1, 0), na.rm=T),
+            area.insect = sum(EXPNS*ifelse(PLT_CN %in% insect.plots, 1, 0), na.rm=T),
+            area.disease = sum(EXPNS*ifelse(PLT_CN %in% disease.plots, 1, 0), na.rm=T),
+            area.id = sum(EXPNS*ifelse(PLT_CN %in% c(disease.plots,insect.plots), 1, 0), na.rm=T),
+            area.fid = sum(EXPNS*ifelse(PLT_CN %in% c(fire.plots,disease.plots,insect.plots), 1, 0), na.rm=T),
+            area.animal = sum(EXPNS*ifelse(PLT_CN %in% animal.plots, 1, 0), na.rm=T),
+            area.competition = sum(EXPNS*ifelse(PLT_CN %in% competition.plots, 1, 0), na.rm=T),
+            area.weather = sum(EXPNS*ifelse(PLT_CN %in% weather.plots, 1, 0), na.rm=T),
+            area.land = sum(EXPNS*ifelse(PLT_CN %in% land.plots, 1, 0), na.rm=T),
+            area.unknown = sum(EXPNS*ifelse(PLT_CN %in% unknown.plots, 1, 0), na.rm=T),
+            area.total = sum(EXPNS*ifelse(PLT_CN %in% all.plots, 1, 0), na.rm=T))
+
+# joining to main summary dataframe
+dall.er.abla <- dall.er.abla %>% 
+  left_join(mort.area.er, by = c("MAP_UNIT_S"="ECOSUBCD")) %>% 
+  mutate(area.fire.prop = area.fire/area.total,
+         area.id.prop = area.id/area.total)
+
+
+```
+
+
+# Figures
+
+The code above results in a data object named `dall.er.abla` that contains many estimated ecoregion-level attributes for subalpine fir and subalpine forests. The following code plots some of these attributes to reproduce main manuscript and additional supplementary figures.
+
+## Current density {.tabset .tabset-pills}
+
+### --
+
+### TPH (Fig. S3)
+
+```{r fig.cap = caption}
+
+caption <- "Figure S3. Current estimated density (trees per hectare) of subalpine fir across ecoregion subsections range-wide."
+
+ggplot() +
+  geom_sf(data = cont %>% 
+            as(.,"sf"),
+          col=linecolor,
+          fill = mapcolor) + 
+  geom_sf(data = states %>% 
+            as(.,"sf"),
+          fill=NA,
+          col=linecolor) +
+  geom_sf(data = dall.er.abla %>% 
+            filter(!is.na(CHNG_PERC.tph),
+                   nPlots_AREA>9),
+          col=linecolor) +
+  geom_sf(data = dall.er.abla %>% 
+            filter(!is.na(CHNG_PERC.tph),
+                   nPlots_AREA>9),
+          col=NA,
+          aes(fill = CURR_TPH)) +
+  geom_sf(data = states %>% 
+            as(.,"sf"),
+          fill=NA,
+          col=linecolor,
+          alpha=0.1,
+          lwd=0.3,
+          lty=2) +
+  theme(panel.background = element_rect(fill="skyblue1")) +
+  scale_fill_steps(name = "ABLA density \n(trees per hectare)",
+                   #na.value="darkgray",
+                   na.value=NA,
+                   low = "white",
+                   high = "forestgreen",
+                   n.breaks = 9)+
+  lims(x = c(-2.5e6, -0.5e6),
+       y = c(1.00e6,3.25e6)) +
+  theme(legend.key.size = unit(1,"cm"))
+
+```
+
+### BAH (Fig. S4)
+
+```{r, fig.cap=caption}
+
+caption <- "Fig S4. Current estimated basal area density (square meters per hectare) of subalpine fir across ecoregion subsections range-wide."
+
+ggplot() +
+  geom_sf(data = cont %>% 
+            as(.,"sf"),
+          col=linecolor,
+          fill = mapcolor) + 
+  geom_sf(data = states %>% 
+            as(.,"sf"),
+          fill=NA,
+          col=linecolor) +
+  geom_sf(data = dall.er.abla %>% 
+            filter(!is.na(CHNG_PERC.tph),
+                   nPlots_AREA>9),
+          col=linecolor) +
+  geom_sf(data = dall.er.abla %>% 
+            filter(!is.na(CHNG_PERC.tph),
+                   nPlots_AREA>9),
+          col=NA,
+          aes(fill = CURR_BAH)) +
+  geom_sf(data = states %>% 
+            as(.,"sf"),
+          fill=NA,
+          col=linecolor,
+          alpha=0.1,
+          lwd=0.3,
+          lty=2) +
+  theme(panel.background = element_rect(fill="skyblue1")) +
+  scale_fill_steps(name = "ABLA density \n(BA per hectare)",
+                   #na.value="darkgray",
+                   na.value=NA,
+                   low = "white",
+                   high = "forestgreen",
+                   n.breaks = 9)+
+  lims(x = c(-2.5e6, -0.5e6),
+       y = c(1.00e6,3.25e6)) +
+  theme(legend.key.size = unit(1,"cm"))
+
+```
+
+## Population change {.tabset .tabset-pills}
+
+### --
+
+### Abundance X Basal area categories (Fig.2a)
+
+```{r, fig.cap = caption}
+
+caption <- "Reproduction of main text Figure 2a."
+
+ggplot() +
+  geom_sf(data = cont %>% 
+            as(.,"sf"),
+          col=linecolor,
+          fill = mapcolor) + 
+  geom_sf(data = states %>% 
+            as(.,"sf"),
+          fill=NA,
+          col=linecolor) +
+  geom_sf(data=dall.er.abla,
+          col=linecolor,
+          fill=NA)+
+  geom_sf(data = dall.er.abla,
+          col=NA,
+          aes(fill = as.factor(change.cat))) +
+  geom_sf(data = states %>% 
+            as(.,"sf"),
+          fill=NA,
+          col=linecolor,
+          alpha=0.1,
+          lwd=0.3,
+          lty=2) +
+  theme(panel.background = element_rect(fill="skyblue1"))+
+  scale_fill_discrete(name = "",
+                      type=c("firebrick4",
+                             "skyblue1",
+                             "dodgerblue4",
+                             "firebrick2"))+
+  lims(x = c(-2.5e6, -0.5e6),
+       y = c(1.00e6,3.25e6))
+
+
+```
+
+
+### Abundance (Fig. 3A)
+
+```{r, fig.cap = caption}
+
+caption <- "Reproduction of main text Figure 3a."
+
+ggplot() +
+  geom_sf(data = cont %>% 
+            as(.,"sf"),
+          col=linecolor,
+          fill = mapcolor) + 
+  geom_sf(data = states %>% 
+            as(.,"sf"),
+          fill=NA,
+          col=linecolor) +
+  geom_sf(data = dall.er.abla %>% 
+            filter(!is.na(CHNG_PERC.tph),
+                   nPlots_AREA>9), # only plot for ecoregions with at least 10 FIA plots
+          col=linecolor) +
+  geom_sf(data = dall.er.abla %>% 
+            filter(!is.na(CHNG_PERC.tph),
+                   nPlots_AREA>9),
+          col=NA,
+          aes(fill = CHNG_PERC.tph)) +
+  geom_sf(data = states %>% 
+            as(.,"sf"),
+          fill=NA,
+          col=linecolor,
+          alpha=0.1,
+          lwd=0.3,
+          lty=2) +
+  theme(panel.background = element_rect(fill="skyblue1")) +
+  scale_fill_steps2(name = "ABLA % change \n(abundance)",
+                    na.value=NA,
+                    low = "firebrick3",
+                    mid="white",
+                    midpoint=0,
+                    high = "darkblue",
+                    limits = c(-100,100),
+                    n.breaks = 9)+
+  lims(x = c(-2.5e6, -0.5e6),
+       y = c(1.00e6,3.25e6)) +
+  theme(legend.key.size = unit(1,"cm"))
+
+```
+
+### Basal area (Fig. S5)
+
+```{r, fig.cap=caption}
+
+caption <- "Figure S5. Estimated subalpine fir basal area change between 2000-2009 and 2010-2019 survey periods estimated within each ecoregion subsection occupied by the species. Estimate is limited to trees with a measured diameter of greater than 12.7 cm. Red indicates basal area decline over the remeasurement period, and blue indicates basal area increase, with darker colors indicating change of greater magnitude."
+
+ggplot() +
+  geom_sf(data = cont %>% 
+            as(.,"sf"),
+          col=linecolor,
+          fill = mapcolor) + 
+  geom_sf(data = states %>% 
+            as(.,"sf"),
+          fill=NA,
+          col=linecolor) +
+  geom_sf(data = dall.er.abla %>% 
+            filter(!is.na(CHNG_PERC.bah),
+                   nPlots_AREA>9),
+          col=linecolor) +
+  geom_sf(data = dall.er.abla %>% 
+            filter(!is.na(CHNG_PERC.bah),
+                   nPlots_AREA>9),
+          col=NA,
+          aes(fill = CHNG_PERC.bah)) +
+  geom_sf(data = states %>% 
+            as(.,"sf"),
+          fill=NA,
+          col=linecolor,
+          alpha=0.1,
+          lwd=0.3,
+          lty=2) +
+  theme(panel.background = element_rect(fill="skyblue1")) +
+  scale_fill_steps2(name = "ABLA % change \n(basal area)",
+                    #na.value="darkgray",
+                    na.value=NA,
+                    low = "firebrick3",
+                    mid="white",
+                    midpoint=0,
+                    high = "darkblue",
+                    limits = c(-100,100),
+                    n.breaks = 9)+
+  lims(x = c(-2.5e6, -0.5e6),
+       y = c(1.00e6,3.25e6)) +
+  theme(legend.key.size = unit(1,"cm"))
+
+```
+
+
+## Mortality {.tabset .tabset-pills}
+
+### --
+
+### Mortality density (Fig. 3B)
+
+```{r, fig.cap = caption}
+
+caption <- "Reproduction of main text Figure 3B."
+
+ggplot() +
+  geom_sf(data = cont %>% 
+            as(.,"sf"),
+          col=linecolor,
+          fill = mapcolor) + 
+  geom_sf(data = states %>% 
+            as(.,"sf"),
+          fill=NA,
+          col=linecolor) +
+  geom_sf(data = dall.er.abla %>% 
+            filter(!is.na(CHNG_PERC.tph),
+                   nPlots_AREA>9),
+          col=linecolor) +
+  geom_sf(data = dall.er.abla %>% 
+            filter(!is.na(CHNG_PERC.tph),
+                   nPlots_AREA>9),
+          col=NA,
+          aes(fill = MORT_TPH)) +
+  geom_sf(data = states %>% 
+            as(.,"sf"),
+          fill=NA,
+          col=linecolor,
+          alpha=0.1,
+          lwd=0.3,
+          lty=2) +
+  theme(panel.background = element_rect(fill="skyblue1")) +
+  scale_fill_steps(name = "",
+                   #na.value="darkgray",
+                   na.value=NA,
+                   low = "white",
+                   high = "firebrick3",
+                   n.breaks = 8)+
+  lims(x = c(-2.5e6, -0.5e6),
+       y = c(1.00e6,3.25e6)) +
+  theme(legend.key.size = unit(1,"cm"))
+
+```
+
+
+### Percent mortality (Fig. 4A)
+
+```{r, fig.cap=caption}
+
+caption <- "Reproduction of main text Figure 3A."
+
+ggplot() +
+  geom_sf(data = cont %>% 
+            as(.,"sf"),
+          col=linecolor,
+          fill = mapcolor) + 
+  geom_sf(data = states %>% 
+            as(.,"sf"),
+          fill=NA,
+          col=linecolor) +
+  geom_sf(data = dall.er.abla %>% 
+            filter(!is.na(CHNG_PERC.tph),
+                   nPlots_AREA>9),
+          lwd=1,
+          aes(fill = ECO_GRP_NEW_NAM,
+              col=ECO_GRP_NEW_NAM)) +
+  geom_sf(data = dall.er.abla %>% 
+            filter(!is.na(CHNG_PERC.tph),
+                   nPlots_AREA>9),
+          fill="white",
+          col=NA,
+          aes(alpha=-MORT_TOTAL.tph/PREV_TOTAL.tph)) +
+  geom_sf(data = states %>% 
+            as(.,"sf"),
+          fill=NA,
+          col=linecolor,
+          alpha=0.1,
+          lwd=0.3,
+          lty=2) +
+  theme(panel.background = element_rect(fill="skyblue1")) +
+  scale_color_manual(name = "Ecological Province",aesthetics = c("fill","col"),
+                     values = regioncolors) +
+  scale_alpha_binned(name = "Net mortality (%)",range = c(0.0,0.95),
+                     n.breaks=5)+
+  lims(x = c(-2.5e6, -0.5e6),
+       y = c(1.00e6,3.25e6))
+```
+
+
+### Survey year mortality (Fig 4B)
+
+```{r, fig.cap = caption}
+
+caption <- "Reproduction of main text Figure 4B."
+
+yearmort <- growMort_dlp.metric(db = all.fia,
+                                stateVar = "TPA",
+                                treeDomain=SPCD==19,
+                                grpBy = c(ECO_GRP_NEW_NAM,MEASYEAR),
+                                totals=T,
+                                returnSpatial=F,
+                                sizeThresh=12.7,
+                                evals=evals) %>% 
+  group_by(ECO_GRP_NEW_NAM,MEASYEAR) %>% 
+  filter(YEAR==max(YEAR))
+
+yearmort %>% 
+  filter(MEASYEAR>2010) %>% 
+  ggplot(.,
+         aes(x = as.factor(MEASYEAR),
+             y = MORT_PERC)) +
+  geom_line(aes(col = ECO_GRP_NEW_NAM,
+                group = ECO_GRP_NEW_NAM),
+            linewidth = 1.5,
+            alpha=0.8) +
+  geom_point(aes(bg = ECO_GRP_NEW_NAM),
+             pch=21,
+             size = 4, 
+             alpha = 0.8) + 
+  scale_color_manual(name = "Ecological Province",aesthetics = c("fill","col","bg"),
+                     values = regioncolors) +
+  labs(x = "Survey year",
+       y = "Mortality (%)") +
+  theme(legend.position="none",
+        axis.text.x = element_text(angle=45,hjust = 1))
+
+```
+
+
+### Mortality agents (Fig. 4C)
+
+This figure requires stratifying mortality estimates by ecological province, rather than by ecoregion subsections, as above. Estimation code is included with figure code below.
+
+```{r, fig.cap = caption}
+
+caption <- "Reproduction of main text Figure 3B."
+
+# total agent-specific mortality for all species
+agents <- all.fia %>% 
+  growMort_dlp.metric(db = .,
+                      stateVar = "TPA",
+                      treeDomain = SPCD==19,
+                      totals = TRUE,
+                      grpBy = c(ECO_GRP_NEW_NAM,agent_key),
+                      returnSpatial = F, 
+                      nCores = 4,
+                      sizeThresh = thresh,
+                      evals = evals,
+                      method="TI",
+                      areaDomain = abla.pres==1) %>% 
+  filter(agent_key!="unknown2") %>% 
+  mutate(PREV_TOTAL_SD = sqrt(PREV_TOTAL_VAR)) %>% 
+  mutate(agent_key = ifelse(agent_key=="unknown1","unknown",agent_key))
+
+agents %>% 
+  filter(YEAR==2019) %>% 
+  ggplot(.,
+         aes(x = reorder(agent_key,-PREV_TOTAL),
+             y = PREV_TOTAL/AREA_TOTAL_ha)) +
+  geom_col(aes(fill=factor(ECO_GRP_NEW_NAM, levels=c("Cascade Mixed Forest",
+                                                     "Northern Rocky Mountain Forest-Steppe",
+                                                     "Middle Rocky Mountain Steppe",
+                                                     "Southern Rocky Mountain Steppe",
+                                                     "zIntermountain Semi-Desert",
+                                                     "AZ-NM Mountains")))) +
+  labs(x = "Mortality agent",
+       y = "Mortality (trees per hectare)") +
+  theme(axis.text.x = element_text(angle=45,hjust=1, size=15)) +
+  scale_y_continuous(labels = scales::comma) +
+  scale_color_manual(name = "Ecological Province",aesthetics = "fill",
+                     values = regioncolors)
+
+
+
+```
+
+## Regeneration {.tabset .tabset-pills}
+
+### --
+
+### Sapling-adult recruitment {.tabset .tabset-pills}
+
+#### 2000-2009 sapling density (Fig. S6)
+
+```{r, fig.cap=caption}
+
+caption <- "Figure S6. Estimated density (trees per hectare) of subalpine fir saplings in ecoregion subsections range-wide, during the 2000-2009 inventory period. Saplings are defined by the FIA program as stems between 2.54 and 12.7 cm diameter. Note that this map excludes ecoregions in Wyoming; this is because trees smaller than 12.7cm could not be linked to earlier periodic inventories."
+
+ggplot() +
+  geom_sf(data = cont %>% 
+            as(.,"sf"),
+          col=linecolor,
+          fill = mapcolor) + 
+  geom_sf(data = states %>% 
+            as(.,"sf"),
+          fill=NA,
+          col=linecolor) +
+  geom_sf(data = dall.er.abla %>% 
+            filter(!is.na(CHNG_PERC.tph),
+                   !MAP_UNIT_S %in% wy.er,
+                   nPlots_AREA>9),
+          col=linecolor) +
+  geom_sf(data = dall.er.abla %>% 
+            filter(!is.na(CHNG_PERC.tph),
+                   !MAP_UNIT_S %in% wy.er,
+                   nPlots_AREA>9),
+          col=NA,
+          aes(fill = SAP_PREV/AREA_TOTAL_ha)) +
+  geom_sf(data = states %>% 
+            as(.,"sf"),
+          fill=NA,
+          col=linecolor,
+          alpha=0.1,
+          lwd=0.3,
+          lty=2) +
+  theme(panel.background = element_rect(fill="skyblue1")) +
+  scale_fill_steps(name = "2000-2009 \nsapling density \n(trees per hectare)",
+                   na.value=NA,
+                   low = "white",
+                   high = "forestgreen",
+                   n.breaks = 9)+
+  lims(x = c(-2.5e6, -0.5e6),
+       y = c(1.00e6,3.25e6)) +
+  theme(legend.key.size = unit(1,"cm"))
+
+```
+
+#### 2010-2019 sapling density (Fig. S7)
+
+```{r, fig.cap=caption}
+
+caption <- "Figure S7. Estimated density (trees per hectare) of subalpine fir saplings in ecoregion subsections range-wide, during the 2010-2019 inventory period. Saplings are defined by the FIA program as stems between 2.54 and 12.7 cm diameter."
+
+ggplot() +
+  geom_sf(data = cont %>% 
+            as(.,"sf"),
+          col=linecolor,
+          fill = mapcolor) + 
+  geom_sf(data = states %>% 
+            as(.,"sf"),
+          fill=NA,
+          col=linecolor) +
+  geom_sf(data = dall.er.abla %>% 
+            filter(!is.na(CHNG_PERC.tph),
+                   nPlots_AREA>9),
+          col=linecolor) +
+  geom_sf(data = dall.er.abla %>% 
+            filter(!is.na(CHNG_PERC.tph),
+                   nPlots_AREA>9),
+          col=NA,
+          aes(fill = SAP_TPH)) +
+  geom_sf(data = states %>% 
+            as(.,"sf"),
+          fill=NA,
+          col=linecolor,
+          alpha=0.1,
+          lwd=0.3,
+          lty=2) +
+  theme(panel.background = element_rect(fill="skyblue1")) +
+  scale_fill_steps(name = "2010-2019 \nsapling density \n(trees per hectare)",
+                   na.value=NA,
+                   low = "white",
+                   high = "forestgreen",
+                   n.breaks = 9)+
+  lims(x = c(-2.5e6, -0.5e6),
+       y = c(1.00e6,3.25e6)) +
+  theme(legend.key.size = unit(1,"cm"))
+
+```
+
+#### 2010-2019 adult recruitment (Fig. 3C)
+
+```{r, fig.cap=caption}
+
+caption <- "Reproduction of main text Figure 3C. Adult recruitment density in trees per hectare between 2000-2009 and 2010-2019 inventories."
+
+ggplot() +
+  geom_sf(data = cont %>% 
+            as(.,"sf"),
+          col=linecolor,
+          fill = mapcolor) + 
+  geom_sf(data = states %>% 
+            as(.,"sf"),
+          fill=NA,
+          col=linecolor) +
+  geom_sf(data = dall.er.abla %>% 
+            filter(!is.na(CHNG_PERC.tph),
+                   nPlots_AREA>9),
+          col=linecolor) +
+  geom_sf(data = dall.er.abla %>% 
+            filter(!is.na(CHNG_PERC.tph),
+                   nPlots_AREA>9),
+          col=NA,
+          aes(fill = RECR_TPH)) +
+  geom_sf(data = states %>% 
+            as(.,"sf"),
+          fill=NA,
+          col=linecolor,
+          alpha=0.1,
+          lwd=0.3,
+          lty=2) +
+  theme(panel.background = element_rect(fill="skyblue1")) +
+  scale_fill_steps(name = "Adult recruitment \n(trees per hectare)",
+                   na.value=NA,
+                   low = "white",
+                   high = "darkblue",
+                   n.breaks = 9)+
+  lims(x = c(-2.5e6, -0.5e6),
+       y = c(1.00e6,3.25e6)) +
+  theme(legend.key.size = unit(1,"cm"))
+
+```
+
+#### Rate figure (Fig. 5A)
+
+```{r fig.cap=caption}
+
+caption <- "Reproduction of main text Figure 5A."
+
+quants <- dall.er.abla %>% 
+  filter(!MAP_UNIT_S %in% wy.er) %>% 
+  mutate(q.y = RECR_TPH,
+         q.x = SAP_PREV/AREA_TOTAL_ha) %>% 
+  rq(q.y ~ q.x,
+     data = .,
+     tau = c(0.05, 0.25,0.5,0.75, 0.95))
+
+quant.pred <- predict(quants) %>% as.data.frame()
+quant.coef <- quants$coefficients %>% as.data.frame()
+
+dall.er.abla %>% 
+  filter(!MAP_UNIT_S %in% wy.er) %>% 
+  arrange(abs(CHNG_PERC.tph)) %>% 
+  ggplot(.) +
+  geom_point(aes(x = SAP_PREV/AREA_TOTAL_ha,
+                 y = RECR_TPH,
+                 bg = CHNG_PERC.tph),
+             pch = 21,
+             size = 6,
+             alpha=0.9) +
+  geom_abline(aes(intercept = quant.coef$`tau= 0.05`[1],
+                  slope = quant.coef$`tau= 0.05`[2]),
+              lty = 3,
+              lwd = 1)+
+  geom_abline(aes(intercept = quant.coef$`tau= 0.25`[1],
+                  slope = quant.coef$`tau= 0.25`[2]),
+              lty = 2,
+              lwd = 1)+
+  geom_abline(aes(intercept = quant.coef$`tau= 0.50`[1],
+                  slope = quant.coef$`tau= 0.50`[2]),
+              lty = 1,
+              lwd = 1)+
+  geom_abline(aes(intercept = quant.coef$`tau= 0.75`[1],
+                  slope = quant.coef$`tau= 0.75`[2]),
+              lty = 2,
+              lwd = 1)+
+  geom_abline(aes(intercept = quant.coef$`tau= 0.95`[1],
+                  slope = quant.coef$`tau= 0.95`[2]),
+              lty = 3,
+              lwd = 1)+
+  labs(y = "Adult recruitment (trees per hectare)",
+       x = "2000-2009 sapling density (per hectare)")+
+  scale_color_steps2(name = "Abundance \nchange (%)",
+                     aesthetics = c("bg"),
+                     na.value=NA,
+                     low = "firebrick3",
+                     mid="white",
+                     midpoint=0,
+                     high = "darkblue",
+                     limits = c(-100,100),
+                     n.breaks = 9)
+
+summary(quants,se="boot")
+
+```
+
+### Seedling-sapling recruitment {.tabset .tabset-pills}
+
+#### 2000-2009 seedling density (Fig. S8)
+
+```{r, fig.cap=caption}
+
+caption <- "Figure S8. Estimated density (trees per hectare) of subalpine fir saplings in ecoregion subsections range-wide, during the 2000-2009 inventory period. Saplings are defined by the FIA program as stems between 2.54 and 12.7 cm diameter. Note that this map excludes ecoregions in Wyoming; this is because trees smaller than 12.7cm could not be linked to earlier periodic inventories."
+
+ggplot() +
+  geom_sf(data = cont %>% 
+            as(.,"sf"),
+          col=linecolor,
+          fill = mapcolor) + 
+  geom_sf(data = states %>% 
+            as(.,"sf"),
+          fill=NA,
+          col=linecolor) +
+  geom_sf(data = dall.er.abla %>% 
+            filter(!is.na(CHNG_PERC.tph),
+                   #!MAP_UNIT_S %in% wy.er,
+                   nPlots_AREA>9),
+          col=linecolor) +
+  geom_sf(data = dall.er.abla %>% 
+            filter(!is.na(CHNG_PERC.tph),
+                   #!MAP_UNIT_S %in% wy.er,
+                   nPlots_AREA>9),
+          col=NA,
+          aes(fill = SEED_TPA_2009/0.4047)) +
+  geom_sf(data = states %>% 
+            as(.,"sf"),
+          fill=NA,
+          col=linecolor,
+          alpha=0.1,
+          lwd=0.3,
+          lty=2) +
+  theme(panel.background = element_rect(fill="skyblue1")) +
+  scale_fill_steps(name = "2000-2009 \nseedling density \n(trees per hectare)",
+                   na.value=NA,
+                   low = "white",
+                   high = "forestgreen",
+                   n.breaks = 9)+
+  lims(x = c(-2.5e6, -0.5e6),
+       y = c(1.00e6,3.25e6)) +
+  theme(legend.key.size = unit(1,"cm"))
+
+```
+
+#### 2010-2019 seedling density (Fig. S9)
+
+```{r, fig.cap=caption}
+
+caption <- "Figure S9. Estimated density (trees per hectare) of subalpine fir saplings in ecoregion subsections range-wide, during the 2010-2019 inventory period. Saplings are defined by the FIA program as stems between 2.54 and 12.7 cm diameter."
+
+ggplot() +
+  geom_sf(data = cont %>% 
+            as(.,"sf"),
+          col=linecolor,
+          fill = mapcolor) + 
+  geom_sf(data = states %>% 
+            as(.,"sf"),
+          fill=NA,
+          col=linecolor) +
+  geom_sf(data = dall.er.abla %>% 
+            filter(!is.na(CHNG_PERC.tph),
+                   nPlots_AREA>9),
+          col=linecolor) +
+  geom_sf(data = dall.er.abla %>% 
+            filter(!is.na(CHNG_PERC.tph),
+                   nPlots_AREA>9),
+          col=NA,
+          aes(fill = SEED_TPA_2019/0.4047)) +
+  geom_sf(data = states %>% 
+            as(.,"sf"),
+          fill=NA,
+          col=linecolor,
+          alpha=0.1,
+          lwd=0.3,
+          lty=2) +
+  theme(panel.background = element_rect(fill="skyblue1")) +
+  scale_fill_steps(name = "2010-2019 \nseedling density \n(trees per hectare)",
+                   na.value=NA,
+                   low = "white",
+                   high = "forestgreen",
+                   n.breaks = 9)+
+  lims(x = c(-2.5e6, -0.5e6),
+       y = c(1.00e6,3.25e6)) +
+  theme(legend.key.size = unit(1,"cm"))
+
+```
+
+#### 2010-2019 sapling recruitment (Fig. S10)
+
+```{r, fig.cap=caption}
+
+caption <- "Figure S10. Estimated sapling (individuals between 2.54 and 12.7 cm DBH) recruitment density (trees per hectare) between 2000-2009 and 2010-2019 inventories. Note that figure excludes WY ecoregions because trees smaller than 12.7 cm DBH could not be linked to earlier inventories."
+
+ggplot() +
+  geom_sf(data = cont %>% 
+            as(.,"sf"),
+          col=linecolor,
+          fill = mapcolor) + 
+  geom_sf(data = states %>% 
+            as(.,"sf"),
+          fill=NA,
+          col=linecolor) +
+  geom_sf(data = dall.er.abla %>% 
+            filter(!is.na(CHNG_PERC.tph),
+                   !MAP_UNIT_S%in%wy.er,
+                   nPlots_AREA>9),
+          col=linecolor) +
+  geom_sf(data = dall.er.abla %>% 
+            filter(!is.na(CHNG_PERC.tph),
+                   !MAP_UNIT_S%in%wy.er,
+                   nPlots_AREA>9),
+          col=NA,
+          aes(fill = SAP_RECR/AREA_TOTAL_ha)) +
+  geom_sf(data = states %>% 
+            as(.,"sf"),
+          fill=NA,
+          col=linecolor,
+          alpha=0.1,
+          lwd=0.3,
+          lty=2) +
+  theme(panel.background = element_rect(fill="skyblue1")) +
+  scale_fill_steps(name = "Sapling recruitment \n(trees per hectare)",
+                   na.value=NA,
+                   low = "white",
+                   high = "darkblue",
+                   n.breaks = 9)+
+  lims(x = c(-2.5e6, -0.5e6),
+       y = c(1.00e6,3.25e6)) +
+  theme(legend.key.size = unit(1,"cm"))
+
+```
+
+#### Rate figure (Fig. 5B)
+
+```{r fig.cap=caption}
+
+caption <- "Reproduction of main text Figure 5B."
+
+quants <- dall.er.abla %>% 
+  filter(!MAP_UNIT_S %in% wy.er) %>% 
+  mutate(q.y = SAP_RECR/AREA_TOTAL_ha,
+         q.x = SEED_TPA_2009/0.4047) %>% 
+  rq(q.y ~ q.x,
+     data = .,
+     tau = c(0.05, 0.25,0.5,0.75, 0.95))
+
+quant.pred <- predict(quants) %>% as.data.frame()
+quant.coef <- quants$coefficients %>% as.data.frame()
+
+dall.er.abla %>% 
+  filter(!MAP_UNIT_S %in% wy.er,
+         !is.na(SEED_TPA_2009)) %>% 
+  arrange(abs(CHNG_PERC.tph)) %>% 
+  ggplot(.) +
+  geom_point(aes(x = SEED_TPA_2009/0.4047,
+                 y = SAP_RECR/AREA_TOTAL_ha,
+                 bg = CHNG_PERC.tph),
+             pch = 21,
+             size = 6,
+             alpha=0.9) +
+  geom_abline(aes(intercept = quant.coef$`tau= 0.05`[1],
+                  slope = quant.coef$`tau= 0.05`[2]),
+              lty = 3,
+              lwd = 1)+
+  geom_abline(aes(intercept = quant.coef$`tau= 0.25`[1],
+                  slope = quant.coef$`tau= 0.25`[2]),
+              lty = 2,
+              lwd = 1)+
+  geom_abline(aes(intercept = quant.coef$`tau= 0.50`[1],
+                  slope = quant.coef$`tau= 0.50`[2]),
+              lty = 1,
+              lwd = 1)+
+  geom_abline(aes(intercept = quant.coef$`tau= 0.75`[1],
+                  slope = quant.coef$`tau= 0.75`[2]),
+              lty = 2,
+              lwd = 1)+
+  geom_abline(aes(intercept = quant.coef$`tau= 0.95`[1],
+                  slope = quant.coef$`tau= 0.95`[2]),
+              lty = 3,
+              lwd = 1)+
+  labs(y = "Sapling recruitment (trees per hectare)",
+       x = "2000-2009 seedling density (per hectare)")+
+  scale_color_steps2(name = "Abundance \nchange (%)",
+                     aesthetics = c("bg"),
+                     na.value=NA,
+                     low = "firebrick3",
+                     mid="white",
+                     midpoint=0,
+                     high = "darkblue",
+                     limits = c(-100,100),
+                     n.breaks = 9)
+
+summary(quants,se="boot")
+
+```
+
+## Disturbance area {.tabset .tabset-pills}
+
+### --
+
+### Fire (Fig. 6A)
+
+```{r, fig.cap=caption}
+
+caption <- "Reproduction of main text Figure 6A."
+
+ggplot() +
+  geom_sf(data = cont %>% 
+            as(.,"sf"),
+          col=linecolor,
+          fill = mapcolor) + 
+  geom_sf(data = states %>% 
+            as(.,"sf"),
+          fill=NA,
+          col=linecolor) +
+  geom_sf(data = dall.er.abla %>% 
+            filter(!is.na(CHNG_PERC.tph),
+                   nPlots_AREA>9) %>% 
+            sf::st_union(),
+          col=linecolor,
+          fill=NA) +  
+  geom_sf(data = dall.er.abla %>% 
+            filter(!is.na(CHNG_PERC.tph),
+                   nPlots_AREA>9),
+          #col=NA,
+          lwd=1,
+          aes(fill = ECO_GRP_NEW_NAM,
+              col=ECO_GRP_NEW_NAM)) +
+  geom_sf(data = dall.er.abla %>% 
+            filter(!is.na(CHNG_PERC.tph),
+                   nPlots_AREA>9),
+          fill="white",
+          col=NA,
+          aes(alpha=-area.fire.prop)) +
+  geom_sf(data = states %>% 
+            as(.,"sf"),
+          fill=NA,
+          col=linecolor,
+          alpha=0.1,
+          lwd=0.3,
+          lty=2) +
+  theme(panel.background = element_rect(fill="skyblue1")) +
+  scale_color_manual(name = "Ecological Province",aesthetics=c("fill","col"),
+                     values = regioncolors)+
+  scale_alpha_binned(name = "fire footprint",range = c(0.0,0.95),
+                     breaks=c(0,-0.25,-0.5,-0.75,-1))+
+  lims(x = c(-2.5e6, -0.5e6),
+       y = c(1.00e6,3.25e6))
+
+
+
+```
+
+### Biological disturbance (Fig. 6B)
+
+*i.e.,* mortality from insects and diseases
+
+```{r, fig.cap=caption}
+
+caption <- "Reproduction of main text Figure 6B."
+
+ggplot() +
+  geom_sf(data = cont %>% 
+            as(.,"sf"),
+          col=linecolor,
+          fill = mapcolor) + 
+  geom_sf(data = states %>% 
+            as(.,"sf"),
+          fill=NA,
+          col=linecolor) +
+  geom_sf(data = dall.er.abla %>% 
+            filter(!is.na(CHNG_PERC.tph),
+                   nPlots_AREA>9) %>% 
+            sf::st_union(),
+          col=linecolor,
+          fill=NA) +  
+  geom_sf(data = dall.er.abla %>% 
+            filter(!is.na(CHNG_PERC.tph),
+                   nPlots_AREA>9),
+          #col=NA,
+          lwd=1,
+          aes(fill = ECO_GRP_NEW_NAM,
+              col=ECO_GRP_NEW_NAM)) +
+  geom_sf(data = dall.er.abla %>% 
+            filter(!is.na(CHNG_PERC.tph),
+                   nPlots_AREA>9),
+          fill="white",
+          col=NA,
+          aes(alpha=-area.id.prop)) +
+  geom_sf(data = states %>% 
+            as(.,"sf"),
+          fill=NA,
+          col=linecolor,
+          alpha=0.1,
+          lwd=0.3,
+          lty=2) +
+  theme(panel.background = element_rect(fill="skyblue1")) +
+  scale_color_manual(name = "Ecological Province",aesthetics=c("fill","col"),
+                     values = regioncolors)+
+  scale_alpha_binned(name = "ID footprint",range = c(0.0,0.95),
+                     breaks=c(0,-0.25,-0.5,-0.75,-1))+
+  lims(x = c(-2.5e6, -0.5e6),
+       y = c(1.00e6,3.25e6))
+```
+
+### Disturbance area X mortality (Fig. 6C)
+
+```{r, fig.cap = caption}
+
+caption <- "Reproduction of main text Figure 6C."
+
+dall.er.abla %>%
+  sf::st_drop_geometry() %>% 
+  ggplot(.) +
+  geom_point(aes(x = area.fire.prop,
+                 y = FIRE_MORT/PREV_TOTAL.tph),
+             pch = 21,
+             col="black",
+             bg = "firebrick2",
+             alpha = 0.5,
+             stroke=0.8,
+             size = 3) +
+  geom_point(aes(x = area.id.prop,
+                 y = ID_MORT/PREV_TOTAL.tph),
+             pch = 21,
+             col="black",
+             bg = "dodgerblue2",
+             alpha = 0.5,
+             stroke=0.8,
+             size = 3) +
+  geom_smooth(aes(x = area.fire.prop,
+                  y = FIRE_MORT/PREV_TOTAL.tph,
+                  col = "Fire"),
+              lwd=1.5,
+              fill = "gray60",
+              method="lm")+
+  geom_smooth(aes(x = area.id.prop,
+                  y = ID_MORT/PREV_TOTAL.tph,
+                  col = "Insect & disease"),
+              lwd=1.5,
+              fill = "gray60",
+              method="lm")+
+  labs(x = "Proportion area impacted",
+       y = "Proportion tree mortality",
+       color = "Mortality source") +
+  scale_color_manual(values=c("Fire" = "firebrick3",
+                              "Insect & disease" = "dodgerblue3")) +
+  guides(col=guide_legend(override.aes = list(fill=NA))) +
+  theme(legend.position = "none") +
+  lims(x=c(0,1))
+
+lm(data=dall.er.abla,
+   formula = FIRE_MORT/PREV_TOTAL.tph ~ area.fire.prop) %>% 
+  summary()
+
+lm(data=dall.er.abla,
+   formula = ID_MORT/PREV_TOTAL.tph ~ area.id.prop) %>% 
+  summary()
+
+```
+
+
+## Ecosystem context {.tabset .tabset-pills}
+
+### --
+
+### Quadrants (Fig. 7A)
+
+*See main text Figure 7 for description of categories*
+```{r, fig.cap = caption}
+
+caption <- "Reproduction of main text Figure 7A."
+
+ggplot() +
+  geom_sf(data = cont %>% 
+            as(.,"sf"),
+          col=linecolor,
+          fill = mapcolor) + 
+  geom_sf(data = states %>% 
+            as(.,"sf"),
+          fill=NA,
+          col=linecolor) +
+  geom_sf(data=dall.er.abla,
+          col=linecolor,
+          fill=NA)+
+  geom_sf(data = dall.er.abla,
+          col=NA,
+          aes(fill = as.factor(quadrant.baa))) +
+  geom_sf(data = states %>% 
+            as(.,"sf"),
+          fill=NA,
+          col=linecolor,
+          alpha=0.1,
+          lwd=0.3,
+          lty=2) +
+  theme(panel.background = element_rect(fill="skyblue1"))+
+  scale_fill_discrete(name = "",
+                      type=c("firebrick4","firebrick2","dodgerblue4","skyblue1"))+
+  lims(x = c(-2.5e6, -0.5e6),
+       y = c(1.00e6,3.25e6))
+
+```
+
+
+
+
+
+
